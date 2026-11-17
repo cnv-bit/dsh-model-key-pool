@@ -1,0 +1,4 @@
+- insert:
+    - id: model-key-pool
+      name: dsh-model-key-pool
+      config: {}

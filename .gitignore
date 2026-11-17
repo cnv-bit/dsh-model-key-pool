@@ -1,0 +1,17 @@
+/*
+!/.gitignore
+!/README.md
+!/package.json
+!/package-lock.json
+!/build.mjs
+!/tsconfig.json
+!/cordis.patch.yml
+!/src/
+/src/*
+!/src/*.ts
+!/src/*.tsx
+!/lib/
+/lib/*
+!/lib/index.js
+!/lib/client.js
+!/lib/typert.js
