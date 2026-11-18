@@ -26,6 +26,8 @@ export const policy = Object.freeze({
   errorBytes: 16_384,
   errorSummaryChars: 800,
   diagnosticTimeoutMs: 15_000,
+  generationTestTimeoutMs: 60_000,
+  geminiTestMaxTokens: 256,
   diagnosticIntervalMs: 500,
   catalogBytes: 1_000_000,
   catalogPages: 5,

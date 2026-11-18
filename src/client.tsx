@@ -44,9 +44,14 @@ const style = `
 .dsh-model-pool .pool-key-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dsh-model-pool .pool-key-summary small{opacity:.75;overflow:hidden;text-overflow:ellipsis}
 .dsh-model-pool .pool-key-status{margin:0;white-space:nowrap;font-size:.85em}
+.dsh-model-pool [data-test-tone="success"]{background:#e9f7ee;color:#175b31;border:1px solid #79bd8b}
+.dsh-model-pool [data-test-tone="error"]{background:#fff0ee;color:#8c231d;border:1px solid #de9189}
+.dsh-model-pool .pool-key-status[data-test-tone]{padding:3px 7px;border-radius:6px}
 .dsh-model-pool .pool-key-details{padding:4px 8px 10px}
 .dsh-model-pool .pool-key-details[hidden]{display:none}
 .dsh-model-pool .pool-key-diagnostic{overflow-wrap:anywhere}
+.dsh-model-pool .pool-test-feedback{display:grid;gap:3px;margin:8px 0;padding:8px 10px;border-radius:8px}
+.dsh-model-pool .pool-test-feedback small{font-size:.85em}
 `
 const newId = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('')
 
@@ -91,7 +96,7 @@ function KeyRow({ channel, entry, model, view, secret, number, initiallyOpen, di
     health?.current ? '当前使用' : health?.verified ? '可用' : '未验证'
   const modelStatus = health?.last?.status ?? health?.health?.status
   const status = test ? test.status : modelStatus ?? catalog?.status
-  const summary = test ? (test.ok ? '连通' : '测试失败') :
+  const summary = running === 'test' ? '正在测试' : test ? (test.ok ? '连接成功' : '连接失败') :
     !entry.enabled || health?.health || health?.verified || modelStatus ? state :
     catalog ? (catalog.ok ? '目录可访问' : '目录失败') : state
   const haveKey = !!(secret.trim() || saved)
@@ -101,6 +106,7 @@ function KeyRow({ channel, entry, model, view, secret, number, initiallyOpen, di
     const modelVersion = modelChanges.current
     setRunning(kind)
     setOpen(true)
+    if (kind === 'test') setTest(undefined)
     let result: DiagnosticResult
     try {
       result = await diagnose({
@@ -122,7 +128,8 @@ function KeyRow({ channel, entry, model, view, secret, number, initiallyOpen, di
         onClick={() => setOpen(!open)}>
         <span aria-hidden="true">{open ? '▾' : '▸'}</span>
         <span className="pool-key-title" title={entry.group}><strong>{number}. {entry.label}</strong><small>{entry.group || '未填写项目或配额组'}</small></span>
-        <span className="pool-key-status">{summary}{status !== undefined && ` · HTTP ${status}`}</span>
+        <span className="pool-key-status" data-test-tone={test && (test.ok ? 'success' : 'error')}>
+          {summary}{running !== 'test' && status !== undefined && ` · HTTP ${status}`}</span>
       </button>
       <button type="button" disabled={!haveKey || !upstream || !!running} onClick={() => void check('test')}>
         {running === 'test' ? '测试中…' : '测试连通'}</button>
@@ -142,9 +149,12 @@ function KeyRow({ channel, entry, model, view, secret, number, initiallyOpen, di
     <label>{saved ? '更换凭证' : 'API Key'} <input type="password" autoComplete="new-password" value={secret}
       onChange={event => setSecret(event.target.value)} placeholder={saved ? '留空保留原凭证' : ''} /></label>
     <small>{upstream ? `测试模型 ${upstream}。测试会发送一次短生成请求。` : '添加模型或从目录中选择模型后即可测试连通。'}</small>
-    {test && <p className="pool-key-diagnostic" role="status">
-      {test.status !== undefined && `HTTP ${test.status} · `}{test.message}{test.elapsedMs > 0 && ` · ${test.elapsedMs} ms`}
-    </p>}
+    {running === 'test' && <p role="status">正在测试 {upstream}，最多等待 {view.policy.generationTestTimeoutMs / 1000} 秒。</p>}
+    {test && <div className="pool-test-feedback pool-key-diagnostic" role="status" data-test-tone={test.ok ? 'success' : 'error'}>
+      <strong>{test.ok ? '连接成功' : '连接失败'}{test.status !== undefined && ` · HTTP ${test.status}`}</strong>
+      <span>{test.message}</span>
+      <small>{upstream}{test.elapsedMs > 0 && ` · ${test.elapsedMs} ms`}</small>
+    </div>}
     {catalog && <p className="pool-key-diagnostic" role="status">
       {catalog.status !== undefined && `目录 HTTP ${catalog.status} · `}{catalog.message}{catalog.partial && '（仅显示已读分页）'}
     </p>}
