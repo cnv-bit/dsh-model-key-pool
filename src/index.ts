@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, createHmac, randomBytes } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import type { Context, Volatile } from '@deepseek-ai/cordis'
 import { credentialKey } from '@deepseek-ai/dsh-credentials'
@@ -9,10 +9,10 @@ import { LlmError, resolveImageAttachmentAccess, type AdapterRegistrationHandle 
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { z } from 'zod'
 import { PoolAdapter } from './adapter.ts'
-import { createBridge } from './bridge.ts'
+import { createBridge, type UpstreamFailure } from './bridge.ts'
 import { Checkpoints, claimProfile } from './checkpoints.ts'
 import { Config, credentialId, namespace, normalizeEndpoint, routeFor, validUpstream, validateConfig, type Channel, type PoolConfig } from './config.ts'
-import { KeyDiagnostics } from './diagnostics.ts'
+import { KeyDiagnostics, type ModelCheck } from './diagnostics.ts'
 import { policy } from './policy.ts'
 import { Scheduler } from './scheduler.ts'
 
@@ -40,10 +40,19 @@ const diagnosticSchema = z.object({
   revision: z.number().int().positive(),
 }).strict()
 const json = (entry: unknown): z.core.util.JSONType => JSON.parse(JSON.stringify(entry))
+type CheckTarget = z.infer<typeof diagnosticSchema> & { model: string }
+type PendingCheck = {
+  target: Omit<CheckTarget, 'secret'>
+  tag: string
+  check: ModelCheck
+  failure?: UpstreamFailure
+}
 
 class PoolService extends TypertRemoteService {
   private pendingWrite = Promise.resolve()
   private readonly diagnostics = new KeyDiagnostics()
+  private readonly pendingChecks = new Map<string, PendingCheck>()
+  private readonly checkSalt = randomBytes(32)
   private readonly host: Context
   private readonly scheduler: Scheduler
   private readonly checkpoints: Checkpoints
@@ -81,7 +90,11 @@ class PoolService extends TypertRemoteService {
 
   @Remote
   save(payload: unknown) {
-    const work = this.pendingWrite.then(() => this.commit(payload))
+    return this.serializeWrite(() => this.commit(payload))
+  }
+
+  private serializeWrite<T>(commit: () => Promise<T>) {
+    const work = this.pendingWrite.then(commit)
     this.pendingWrite = work.then(() => {}, () => {})
     return work
   }
@@ -105,9 +118,74 @@ class PoolService extends TypertRemoteService {
       secret = record?.kind === 'api-key' ? record.key : undefined
       if (!secret || !secretSchema.safeParse(secret).success) throw new Error('已保存的凭证不可用，请重新输入')
     }
-    return json(await this.diagnostics.run({ kind, endpoint, secret, model }))
+    let failure: UpstreamFailure | undefined
+    const result = await this.diagnostics.run({ kind, endpoint, secret, model }, received => { failure = received })
+    if (model) {
+      const { ok, status, message, elapsedMs } = result
+      const target = { channelId, keyId, kind, endpoint, revision, model }
+      const probe = { target, tag: this.checkTag(secret), check: { ok, status, message, elapsedMs, at: Date.now() }, failure }
+      await this.serializeWrite(async () => {
+        const candidate = this.findCheckCandidate(target)
+        if (candidate && (candidate.key.revision === revision || candidate.key.revision === revision + 1) &&
+            await this.matchesSavedCheck(probe, candidate.key.revision)) {
+          this.scheduler.recordCheck(candidate, probe.check, failure)
+          if (!this.checkpoints.blocked) await this.checkpoints.save()
+        } else {
+          this.rememberDraftCheck(probe)
+        }
+      })
+    }
+    return json(result)
   }
 
+  private checkTag(secret: string) {
+    return createHmac('sha256', this.checkSalt).update(secret).digest('hex')
+  }
+
+  private findCheckCandidate(target: PendingCheck['target']) {
+    const channel = this.scheduler.config.channels.find(channel =>
+      channel.id === target.channelId && channel.kind === target.kind && channel.endpoint === target.endpoint)
+    const key = channel?.keys.find(key => key.id === target.keyId)
+    const model = channel?.models.find(model => model.upstream === target.model)
+    return channel && key && model ? { channel, key, model } : undefined
+  }
+
+  private async matchesSavedCheck(probe: PendingCheck, revision: number) {
+    const { channelId, keyId } = probe.target
+    const record = await this.host.credentials.readRecord(this.credential(channelId, keyId, revision))
+    return record?.kind === 'api-key' && !!record.key && this.checkTag(record.key) === probe.tag
+  }
+
+  private rememberDraftCheck(probe: PendingCheck) {
+    const { channelId, keyId, kind, endpoint, revision, model } = probe.target
+    const id = JSON.stringify([channelId, keyId, kind, endpoint, revision, model, probe.tag])
+    this.pendingChecks.delete(id)
+    this.pendingChecks.set(id, probe)
+    if (this.pendingChecks.size > policy.pendingCheckCapacity) {
+      const oldest = this.pendingChecks.keys().next()
+      if (!oldest.done) this.pendingChecks.delete(oldest.value)
+    }
+  }
+
+  private async commitDraftChecks() {
+    for (const [id, probe] of this.pendingChecks) {
+      if (Date.now() - probe.check.at > policy.pendingCheckMs) {
+        this.pendingChecks.delete(id)
+        continue
+      }
+      const candidate = this.findCheckCandidate(probe.target)
+      if (!candidate) continue
+      const revision = candidate.key.revision
+      if (revision < probe.target.revision || revision > probe.target.revision + 1) {
+        this.pendingChecks.delete(id)
+        continue
+      }
+      if (!await this.matchesSavedCheck(probe, revision)) continue
+      this.scheduler.recordCheck(candidate, probe.check, probe.failure)
+      this.pendingChecks.delete(id)
+    }
+    if (!this.checkpoints.blocked) await this.checkpoints.save()
+  }
   private async commit(payload: unknown) {
     const parsed = saveSchema.safeParse(payload)
     if (!parsed.success) throw new Error('密钥池配置或凭证格式无效，请检查输入')
@@ -158,6 +236,8 @@ class PoolService extends TypertRemoteService {
         if (!live.has(ref)) await this.removeCredential(ref)
       }
     }
+    try { await this.commitDraftChecks() }
+    catch { this.cleanupIssue = '配置已保存，但无法核对草稿测试使用的凭证，请重新测试。' }
     return this.read()
   }
 

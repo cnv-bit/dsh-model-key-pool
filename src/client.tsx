@@ -73,15 +73,20 @@ function KeyRow({ channel, entry, model, view, secret, number, initiallyOpen, di
 }) {
   const [open, setOpen] = useState(initiallyOpen)
   const [running, setRunning] = useState<'test' | 'catalog'>()
-  const [test, setTest] = useState<DiagnosticResult>()
+  const [draftTest, setTest] = useState<DiagnosticResult>()
   const [catalog, setCatalog] = useState<DiagnosticResult>()
   const [picked, setPicked] = useState('')
   const keyChanges = useRef(0)
   const modelChanges = useRef(0)
-  const saved = view.config.channels.find(row => row.id === channel.id)?.keys.find(row => row.id === entry.id)
+  const savedChannel = view.config.channels.find(row => row.id === channel.id)
+  const saved = savedChannel?.keys.find(row => row.id === entry.id)
   const configured = channel.models.find(row => row.id === model && row.upstream) ?? channel.models.find(row => row.upstream)
   const upstream = picked || configured?.upstream
-  const health = view.health.find(row => row.channelId === channel.id && row.keyId === entry.id && row.modelId === configured?.id)
+  const savedModel = savedChannel?.models.find(row => row.upstream === upstream)
+  const health = !secret.trim() && saved?.revision === entry.revision && savedChannel?.endpoint === channel.endpoint
+    ? view.health.find(row => row.channelId === channel.id && row.keyId === entry.id && row.modelId === savedModel?.id)
+    : undefined
+  const test = draftTest ?? health?.check
   useEffect(() => {
     keyChanges.current++
     setTest(undefined)
@@ -93,10 +98,13 @@ function KeyRow({ channel, entry, model, view, secret, number, initiallyOpen, di
     setTest(undefined)
   }, [upstream])
   const state = !entry.enabled ? '已停用' : health?.health ? labels[health.health.reason] :
-    health?.current ? '当前使用' : health?.verified ? '可用' : '未验证'
-  const modelStatus = health?.last?.status ?? health?.health?.status
-  const status = test ? test.status : modelStatus ?? catalog?.status
-  const summary = running === 'test' ? '正在测试' : test ? (test.ok ? '连接成功' : '连接失败') :
+    health?.current ? '当前使用' : health?.verified || test?.ok ? '可用' : '未验证'
+  const activeBlock = health?.health
+  const modelStatus = activeBlock?.status ?? health?.last?.status
+  const status = activeBlock ? activeBlock.status : test ? test.status : modelStatus ?? catalog?.status
+  const tone = activeBlock ? 'error' : test ? (test.ok ? 'success' : 'error') : undefined
+  const summary = running === 'test' ? '正在测试' : activeBlock || !entry.enabled ? state :
+    test ? (test.ok ? '连接成功' : '连接失败') :
     !entry.enabled || health?.health || health?.verified || modelStatus ? state :
     catalog ? (catalog.ok ? '目录可访问' : '目录失败') : state
   const haveKey = !!(secret.trim() || saved)
@@ -128,7 +136,7 @@ function KeyRow({ channel, entry, model, view, secret, number, initiallyOpen, di
         onClick={() => setOpen(!open)}>
         <span aria-hidden="true">{open ? '▾' : '▸'}</span>
         <span className="pool-key-title" title={entry.group}><strong>{number}. {entry.label}</strong><small>{entry.group || '未填写项目或配额组'}</small></span>
-        <span className="pool-key-status" data-test-tone={test && (test.ok ? 'success' : 'error')}>
+        <span className="pool-key-status" title={activeBlock ? state : test?.message} data-test-tone={tone}>
           {summary}{running !== 'test' && status !== undefined && ` · HTTP ${status}`}</span>
       </button>
       <button type="button" disabled={!haveKey || !upstream || !!running} onClick={() => void check('test')}>
@@ -153,7 +161,8 @@ function KeyRow({ channel, entry, model, view, secret, number, initiallyOpen, di
     {test && <div className="pool-test-feedback pool-key-diagnostic" role="status" data-test-tone={test.ok ? 'success' : 'error'}>
       <strong>{test.ok ? '连接成功' : '连接失败'}{test.status !== undefined && ` · HTTP ${test.status}`}</strong>
       <span>{test.message}</span>
-      <small>{upstream}{test.elapsedMs > 0 && ` · ${test.elapsedMs} ms`}</small>
+      <small>{upstream}{test.elapsedMs > 0 && ` · ${test.elapsedMs} ms`}
+        {!draftTest && health?.check && ` · ${new Date(health.check.at).toLocaleString()}`}</small>
     </div>}
     {catalog && <p className="pool-key-diagnostic" role="status">
       {catalog.status !== undefined && `目录 HTTP ${catalog.status} · `}{catalog.message}{catalog.partial && '（仅显示已读分页）'}

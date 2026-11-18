@@ -31,5 +31,8 @@ export const policy = Object.freeze({
   diagnosticIntervalMs: 500,
   catalogBytes: 1_000_000,
   catalogPages: 5,
-  checkpointBytes: 1_000_000,
+  checkpointBytes: 4_000_000,
+  modelCheckCapacity: 512,
+  pendingCheckCapacity: 256,
+  pendingCheckMs: 60 * 60_000,
 })

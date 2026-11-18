@@ -6,12 +6,23 @@ import { policy } from './policy.ts'
 import type { Scheduler } from './scheduler.ts'
 
 const entry = z.object({
-  reason: z.enum(['DAILY_QUOTA', 'BALANCE', 'INVALID_KEY', 'PERMISSION']),
+  reason: z.enum(['DAILY_QUOTA', 'BALANCE', 'INVALID_KEY', 'PERMISSION', 'RATE_LIMIT']),
   until: z.number().int().positive().max(8.64e15).optional(),
   status: z.number().int().min(100).max(599).optional(),
   code: z.string().regex(/^[a-z0-9_:-]{1,100}$/i).optional(),
 }).strict()
-const schema = z.object({ version: z.literal(1), health: z.array(z.tuple([z.string().max(800), entry])) }).strict()
+const healthSchema = z.array(z.tuple([z.string().max(800), entry]))
+const checkSchema = z.object({
+  at: z.number().int().positive(), ok: z.boolean(), status: z.number().int().min(100).max(599).optional(),
+  message: z.string().max(policy.errorSummaryChars + 150), elapsedMs: z.number().int().nonnegative(),
+}).strict()
+const schema = z.discriminatedUnion('version', [
+  z.object({ version: z.literal(1), health: healthSchema }).strict(),
+  z.object({
+    version: z.literal(2), health: healthSchema,
+    checks: z.array(z.tuple([z.string().regex(/^[0-9a-f]{64}$/), checkSchema])).max(policy.modelCheckCapacity),
+  }).strict(),
+])
 
 export class Checkpoints {
   issue?: string
@@ -33,6 +44,9 @@ export class Checkpoints {
       const snapshot = schema.parse(JSON.parse(await readFile(this.path, 'utf8')))
       for (const [id, record] of snapshot.health) {
         if (!record.until || record.until > Date.now()) this.scheduler.health.set(id, record)
+      }
+      if (snapshot.version === 2) {
+        for (const [id, check] of snapshot.checks) this.scheduler.modelChecks.set(id, check)
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
@@ -58,9 +72,9 @@ export class Checkpoints {
     try {
       while (this.changed) {
         this.changed = false
-        const health = [...this.scheduler.health].filter(([, record]) =>
-          record.reason !== 'RATE_LIMIT' && (!record.until || record.until > Date.now()))
-        const document = JSON.stringify({ version: 1, health })
+        const health = [...this.scheduler.health].filter(([, record]) => !record.until || record.until > Date.now())
+        const checks = [...this.scheduler.modelChecks]
+        const document = JSON.stringify({ version: 2, health, checks })
         if (Buffer.byteLength(document) > policy.checkpointBytes) throw new Error('oversized checkpoint')
         await writeFileAtomic(this.path, document, { mode: 0o600, dirMode: 0o700 })
         this.issue = undefined

@@ -1,5 +1,8 @@
 import type { Channel, KeyConfig, ModelConfig, PoolConfig } from './config.ts'
-import type { Decision, Reason, Scope } from './errors.ts'
+import { createHash } from 'node:crypto'
+import type { ModelCheck } from './diagnostics.ts'
+import { classify, type Decision, type Reason, type Scope } from './errors.ts'
+import type { UpstreamFailure } from './bridge.ts'
 import { policy } from './policy.ts'
 
 export type Health = { reason: Reason; until?: number; status?: number; code?: string }
@@ -33,6 +36,8 @@ const encoded = (...parts: (string | number)[]) => JSON.stringify(parts)
 const identity = ({ channel, key }: Candidate) => encoded(channel.id, key.id, key.revision)
 const vendor = (channel: Channel) => channel.kind === 'google' ? 'google' : new URL(channel.endpoint).origin
 const group = ({ key }: Candidate) => key.group || '未确认'
+const checkAddress = ({ channel, key, model }: Candidate) => createHash('sha256')
+  .update(encoded(channel.id, channel.kind, channel.endpoint, key.id, key.revision, model.upstream)).digest('hex')
 function scopeKey(candidate: Candidate, scope: Scope) {
   const { channel, model } = candidate
   switch (scope) {
@@ -54,6 +59,7 @@ export class Scheduler {
   readonly health = new Map<string, Health>()
   readonly recent = new Map<string, Omit<Decision, 'action' | 'retry'> & { at: number }>()
   readonly verified = new Set<string>()
+  readonly modelChecks = new Map<string, ModelCheck>()
   readonly pools = new Map<string, Pool>()
   private readonly gates = new Map<string, Gate>()
   private readonly modelRpm = new Map<string, number>()
@@ -82,6 +88,8 @@ export class Scheduler {
     for (const collection of [this.health, this.recent, this.verified]) {
       for (const key of collection.keys()) if (!active.has(key)) collection.delete(key)
     }
+    const liveChecks = new Set(candidates.map(checkAddress))
+    for (const id of this.modelChecks.keys()) if (!liveChecks.has(id)) this.modelChecks.delete(id)
     this.pump()
   }
 
@@ -113,6 +121,11 @@ export class Scheduler {
       this.verified.add(modelScope)
       return
     }
+    this.recordFailure(candidate, decision, sentAt)
+  }
+
+  private recordFailure(candidate: Candidate, decision: Decision, sentAt: number) {
+    const modelScope = scopeKey(candidate, 'key-model')
     this.recent.set(modelScope, { at: Date.now(), status: decision.status, code: decision.code, description: decision.description,
       groupConflict: decision.groupConflict })
     const action = decision.action
@@ -128,8 +141,29 @@ export class Scheduler {
         (record.until !== undefined && (previous.until >= record.until ||
          (record.reason === 'RATE_LIMIT' && previous.until > sentAt))))) return
     this.health.set(key, record)
-    if (record.reason !== 'RATE_LIMIT') this.onCheckpoint?.()
+    this.onCheckpoint?.()
     this.pump()
+  }
+
+  recordCheck(candidate: Candidate, check: ModelCheck, failure?: UpstreamFailure) {
+    const id = checkAddress(candidate)
+    if ((this.modelChecks.get(id)?.at ?? 0) > check.at) return
+    this.modelChecks.delete(id)
+    this.modelChecks.set(id, check)
+    if (this.modelChecks.size > policy.modelCheckCapacity) {
+      const oldest = this.modelChecks.keys().next()
+      if (!oldest.done) this.modelChecks.delete(oldest.value)
+    }
+    if (failure && (this.recent.get(scopeKey(candidate, 'key-model'))?.at ?? 0) <= check.at) {
+      this.recordFailure(candidate, classify(candidate.channel.kind, failure, check.at, candidate.key.group),
+        check.at - check.elapsedMs)
+    } else if (check.ok) {
+      for (const scope of ['key', 'key-model'] as const) {
+        const id = scopeKey(candidate, scope)
+        const reason = this.health.get(id)?.reason
+        if (reason === 'INVALID_KEY' || reason === 'PERMISSION') this.health.delete(id)
+      }
+    }
   }
 
   recover(candidate: Candidate) {
@@ -148,6 +182,7 @@ export class Scheduler {
       return {
         channelId: candidate.channel.id, keyId: candidate.key.id, modelId: candidate.model.id,
         health: this.status(candidate), last: this.recent.get(modelScope),
+        check: this.modelChecks.get(checkAddress(candidate)),
         verified: this.verified.has(modelScope), current: active?.identity === identity(candidate) && !this.status(candidate),
         rpm: this.gateSpecs(candidate).reduce<number>((min, spec) => Math.min(min, spec.rpm), policy.hardRpm),
       }

@@ -1,7 +1,7 @@
 import { attributionHeaders } from '@deepseek-ai/dsh-llm'
 import { setTimeout as delay } from 'node:timers/promises'
 import { z } from 'zod'
-import { readBoundedBody, readFailure, type Protocol } from './bridge.ts'
+import { readBoundedBody, readFailure, type Protocol, type UpstreamFailure } from './bridge.ts'
 import { validUpstream } from './config.ts'
 import { classify } from './errors.ts'
 import { policy } from './policy.ts'
@@ -9,6 +9,7 @@ import { policy } from './policy.ts'
 export type DiagnosticResult = {
   ok: boolean; status?: number; message: string; elapsedMs: number; models?: string[]; partial?: boolean
 }
+export type ModelCheck = Pick<DiagnosticResult, 'ok' | 'status' | 'message' | 'elapsedMs'> & { at: number }
 type DiagnosticRequest = { kind: Protocol; endpoint: string; secret: string; model?: string }
 const geminiCatalog = z.object({
   models: z.array(z.object({ name: z.string(), supportedGenerationMethods: z.array(z.string()).optional() })).default([]),
@@ -95,7 +96,7 @@ export class KeyDiagnostics {
   private running = false
   private lastSent = -Infinity
 
-  async run(request: DiagnosticRequest): Promise<DiagnosticResult> {
+  async run(request: DiagnosticRequest, onFailure?: (failure: UpstreamFailure) => void): Promise<DiagnosticResult> {
     if (this.running) throw new Error('已有 Key 正在测试或获取模型，请稍后重试')
     this.running = true
     const started = performance.now()
@@ -124,6 +125,7 @@ export class KeyDiagnostics {
       ({ ok, message, status, elapsedMs: Math.round(performance.now() - started) })
     const failed = async (response: Response) => {
       const failure = await readFailure(response, secret)
+      onFailure?.(failure)
       const { code, description } = classify(kind, failure, Date.now(), '')
       return result(false, [code, description].filter(Boolean).join(' · ') || '上游拒绝请求', response.status)
     }
