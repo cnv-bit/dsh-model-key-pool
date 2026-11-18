@@ -1,9 +1,10 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-api-remotes/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type { Channel, KeyConfig, KeyInput, ModelConfig, PoolConfig } from './config.ts'
+import type { DiagnosticResult } from './diagnostics.ts'
 import type { Scheduler } from './scheduler.ts'
 import type { policy } from './policy.ts'
 import { poolRemote } from './remote.ts'
@@ -13,7 +14,11 @@ type View = {
   health: ReturnType<Scheduler['snapshot']>
   issue?: string; checkpointBlocked: boolean
 }
-type Call = (method: 'read' | 'save' | 'restore', payload?: unknown) => Promise<View>
+type Diagnose = (payload: unknown) => Promise<DiagnosticResult>
+type Call = {
+  (method: 'read' | 'save' | 'restore', payload?: unknown): Promise<View>
+  (method: 'diagnose', payload: unknown): Promise<DiagnosticResult>
+}
 const NS = 'model-key-pool'
 const labels = {
   RATE_LIMIT: '频控冷却', DAILY_QUOTA: '日额度耗尽', BALANCE: '余额或预算不足',
@@ -33,6 +38,15 @@ const style = `
 .dsh-model-pool .pool-method{color:#bf5734}
 .dsh-model-pool .pool-bulk>label{display:grid;gap:6px;margin:8px 0}
 .dsh-model-pool .pool-bulk textarea{box-sizing:border-box;width:100%}
+.dsh-model-pool .pool-key{border-bottom:1px solid #80808040}
+.dsh-model-pool .pool-key-header{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:7px 0}
+.dsh-model-pool button.pool-key-summary{flex:1 1 16em;display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:8px;align-items:center;text-align:left;border:0;min-width:0}
+.dsh-model-pool .pool-key-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dsh-model-pool .pool-key-summary small{opacity:.75;overflow:hidden;text-overflow:ellipsis}
+.dsh-model-pool .pool-key-status{margin:0;white-space:nowrap;font-size:.85em}
+.dsh-model-pool .pool-key-details{padding:4px 8px 10px}
+.dsh-model-pool .pool-key-details[hidden]{display:none}
+.dsh-model-pool .pool-key-diagnostic{overflow-wrap:anywhere}
 `
 const newId = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('')
 
@@ -47,15 +61,76 @@ function newKey(number: number): KeyConfig {
   return { id: newId(), label: `Key ${number}`, enabled: true, revision: 1, group: '' }
 }
 
-function KeyRow({ channel, entry, model, view, secret, disabled, change, setSecret, remove, restore }: {
-  channel: Channel; entry: KeyConfig; model: string; view: View; secret: string; disabled: boolean
+function KeyRow({ channel, entry, model, view, secret, number, initiallyOpen, diagnose, addModel, change, setSecret, remove, restore }: {
+  channel: Channel; entry: KeyConfig; model: string; view: View; secret: string; number: number; initiallyOpen: boolean
+  diagnose: Diagnose; addModel: (model: string) => void
   change: (patch: Partial<KeyConfig>) => void; setSecret: (secret: string) => void; remove: () => void; restore: () => void
 }) {
-  const health = view.health.find(row => row.channelId === channel.id && row.keyId === entry.id && row.modelId === model)
+  const [open, setOpen] = useState(initiallyOpen)
+  const [running, setRunning] = useState<'test' | 'catalog'>()
+  const [test, setTest] = useState<DiagnosticResult>()
+  const [catalog, setCatalog] = useState<DiagnosticResult>()
+  const [picked, setPicked] = useState('')
+  const keyChanges = useRef(0)
+  const modelChanges = useRef(0)
+  const saved = view.config.channels.find(row => row.id === channel.id)?.keys.find(row => row.id === entry.id)
+  const configured = channel.models.find(row => row.id === model && row.upstream) ?? channel.models.find(row => row.upstream)
+  const upstream = picked || configured?.upstream
+  const health = view.health.find(row => row.channelId === channel.id && row.keyId === entry.id && row.modelId === configured?.id)
+  useEffect(() => {
+    keyChanges.current++
+    setTest(undefined)
+    setCatalog(undefined)
+    setPicked('')
+  }, [channel.kind, channel.endpoint, entry.revision, secret])
+  useEffect(() => {
+    modelChanges.current++
+    setTest(undefined)
+  }, [upstream])
   const state = !entry.enabled ? '已停用' : health?.health ? labels[health.health.reason] :
     health?.current ? '当前使用' : health?.verified ? '可用' : '未验证'
-  return <fieldset>
-    <legend>{entry.label}</legend>
+  const modelStatus = health?.last?.status ?? health?.health?.status
+  const status = test ? test.status : modelStatus ?? catalog?.status
+  const summary = test ? (test.ok ? '连通' : '测试失败') :
+    !entry.enabled || health?.health || health?.verified || modelStatus ? state :
+    catalog ? (catalog.ok ? '目录可访问' : '目录失败') : state
+  const haveKey = !!(secret.trim() || saved)
+  const detailsId = `pool-key-${channel.id}-${entry.id}`
+  const check = async (kind: 'test' | 'catalog') => {
+    const keyVersion = keyChanges.current
+    const modelVersion = modelChanges.current
+    setRunning(kind)
+    setOpen(true)
+    let result: DiagnosticResult
+    try {
+      result = await diagnose({
+        channelId: channel.id, keyId: entry.id, kind: channel.kind, endpoint: channel.endpoint, revision: entry.revision,
+        ...(secret.trim() && { secret: secret.trim() }), ...(kind === 'test' && { model: upstream }),
+      })
+    } catch (error) {
+      result = { ok: false, message: error instanceof Error ? error.message : '请求失败', elapsedMs: 0 }
+    }
+    if (keyChanges.current === keyVersion) {
+      if (kind === 'catalog') setCatalog(result)
+      else if (modelChanges.current === modelVersion) setTest(result)
+    }
+    setRunning(undefined)
+  }
+  return <div className="pool-key">
+    <div className="pool-key-header">
+      <button type="button" className="pool-key-summary" aria-expanded={open} aria-controls={detailsId}
+        onClick={() => setOpen(!open)}>
+        <span aria-hidden="true">{open ? '▾' : '▸'}</span>
+        <span className="pool-key-title" title={entry.group}><strong>{number}. {entry.label}</strong><small>{entry.group || '未填写项目或配额组'}</small></span>
+        <span className="pool-key-status">{summary}{status !== undefined && ` · HTTP ${status}`}</span>
+      </button>
+      <button type="button" disabled={!haveKey || !upstream || !!running} onClick={() => void check('test')}>
+        {running === 'test' ? '测试中…' : '测试连通'}</button>
+      <button type="button" disabled={!haveKey || !!running} onClick={() => void check('catalog')}>
+        {running === 'catalog' ? '获取中…' : '获取模型'}</button>
+    </div>
+    <div className="pool-key-details" id={detailsId} hidden={!open}>
+    <fieldset disabled={!!running}>
     <div className="pool-row">
       <label>别名 <input value={entry.label} onChange={event => change({ label: event.target.value })} /></label>
       <label>{channel.kind === 'google' ? '项目 ID / 编号' : '共享配额组'}
@@ -64,10 +139,25 @@ function KeyRow({ channel, entry, model, view, secret, disabled, change, setSecr
       <label><input type="checkbox" checked={entry.enabled} onChange={event => change({ enabled: event.target.checked })} />启用</label>
       <button type="button" onClick={remove}>删除 Key</button>
     </div>
-    <label>{health ? '更换凭证' : 'API Key'} <input type="password" autoComplete="new-password" value={secret}
-      onChange={event => setSecret(event.target.value)} placeholder={health ? '留空保留原凭证' : ''} /></label>
-    {model && <div className="pool-row">
-      <span>{model} · {state}{health && ` · ${health.rpm} RPM`}</span>
+    <label>{saved ? '更换凭证' : 'API Key'} <input type="password" autoComplete="new-password" value={secret}
+      onChange={event => setSecret(event.target.value)} placeholder={saved ? '留空保留原凭证' : ''} /></label>
+    <small>{upstream ? `测试模型 ${upstream}。测试会发送一次短生成请求。` : '添加模型或从目录中选择模型后即可测试连通。'}</small>
+    {test && <p className="pool-key-diagnostic" role="status">
+      {test.status !== undefined && `HTTP ${test.status} · `}{test.message}{test.elapsedMs > 0 && ` · ${test.elapsedMs} ms`}
+    </p>}
+    {catalog && <p className="pool-key-diagnostic" role="status">
+      {catalog.status !== undefined && `目录 HTTP ${catalog.status} · `}{catalog.message}{catalog.partial && '（仅显示已读分页）'}
+    </p>}
+    {!!catalog?.models?.length && <div className="pool-row">
+      <label>上游模型目录 <select value={picked} onChange={event => setPicked(event.target.value)}>
+        <option value="">选择一个模型</option>
+        {catalog.models.map(id => <option key={id}>{id}</option>)}
+      </select></label>
+      <button type="button" disabled={!picked || channel.models.some(entry => entry.upstream === picked)}
+        onClick={() => addModel(picked)}>加入渠道</button>
+    </div>}
+    {configured && <div className="pool-row">
+      <span>{configured.id} · {state}{health && ` · ${health.rpm} RPM`}</span>
       {health?.health?.until && <span>恢复时间 {new Date(health.health.until).toLocaleString()}</span>}
       {health?.last && <details><summary>错误详情</summary>
         <small>{new Date(health.last.at).toLocaleString()}</small>
@@ -76,9 +166,11 @@ function KeyRow({ channel, entry, model, view, secret, disabled, change, setSecr
         {health.last.groupConflict && '。上游项目与配置不一致，请核对项目编号。'}
       </details>}
       {health?.health &&
-        <button type="button" disabled={disabled} onClick={restore}>清除本地封存</button>}
+        <button type="button" onClick={restore}>清除本地封存</button>}
     </div>}
-  </fieldset>
+    </fieldset>
+    </div>
+  </div>
 }
 
 function ModelRow({ entry, change, remove }: {
@@ -136,6 +228,8 @@ function Card({ call }: { call: Call }) {
   const [busy, setBusy] = useState(false)
   const [chosenModel, setChosenModel] = useState('')
   const [kind, setKind] = useState<Channel['kind']>('google')
+  const [newKeyId, setNewKeyId] = useState('')
+  const [formEpoch, setFormEpoch] = useState(0)
   useEffect(() => {
     let mounted = true
     let loading = false
@@ -171,6 +265,8 @@ function Card({ call }: { call: Call }) {
         setDraft(structuredClone(next.config))
         setRevision(next.revision)
         setSecrets({})
+        setNewKeyId('')
+        setFormEpoch(epoch => epoch + 1)
       }
     } catch (error) { setMessage(String(error)) }
     finally { setBusy(false) }
@@ -250,19 +346,35 @@ function Card({ call }: { call: Call }) {
             <button type="button" onClick={() => changeChannel(index, { models: [...channel.models,
               { id: '', upstream: '', tools: true, images: false, reasoning: channel.kind === 'google' }] })}>添加模型</button>
           </fieldset>
-          {channel.keys.map(key => {
+          {channel.keys.map((key, keyIndex) => {
             const id = `${channel.id}/${key.id}`
-            return <KeyRow key={key.id} channel={channel} entry={key} model={selected} view={view}
-              secret={secrets[id] ?? ''} disabled={busy}
+            return <KeyRow key={`${key.id}/${formEpoch}`} channel={channel} entry={key} model={selected} view={view}
+              secret={secrets[id] ?? ''} number={keyIndex + 1} initiallyOpen={newKeyId === key.id}
+              diagnose={payload => call('diagnose', payload)}
+              addModel={upstream => {
+                const base = upstream.replaceAll('/', '-')
+                let id = base
+                for (let suffix = 2; channel.models.some(model => model.id === id); suffix++) {
+                  id = `${base.slice(0, 150)}-${suffix}`
+                }
+                changeChannel(index, { models: [...channel.models, {
+                  id, upstream, tools: true, images: false, reasoning: channel.kind === 'google',
+                }] })
+              }}
               change={patch => changeChannel(index, { keys: channel.keys.map(entry => entry.id === key.id ? { ...entry, ...patch } : entry) })}
               setSecret={secret => setSecrets(current => ({ ...current, [id]: secret }))}
               remove={() => {
                 changeChannel(index, { keys: channel.keys.filter(entry => entry.id !== key.id) })
                 setSecrets(current => Object.fromEntries(Object.entries(current).filter(([name]) => name !== id)))
               }}
-              restore={() => void perform(() => call('restore', { channelId: channel.id, keyId: key.id, modelId: selected }))} />
+              restore={() => void perform(() => call('restore', { channelId: channel.id, keyId: key.id,
+                modelId: (channel.models.find(row => row.id === selected && row.upstream) ?? channel.models.find(row => row.upstream))?.id }))} />
           })}
-          <button type="button" onClick={() => changeChannel(index, { keys: [...channel.keys, newKey(channel.keys.length + 1)] })}>添加 Key</button>
+          <button type="button" onClick={() => {
+            const entry = newKey(channel.keys.length + 1)
+            setNewKeyId(entry.id)
+            changeChannel(index, { keys: [...channel.keys, entry] })
+          }}>添加 Key</button>
           <BulkKeys count={channel.keys.length} add={entries => {
             changeChannel(index, { keys: [...channel.keys, ...entries.map(entry => entry.key)] })
             setSecrets(current => ({
@@ -296,12 +408,12 @@ export function apply(ctx: Context) {
     return () => { active = false; dispose?.() }
   })
   ctx.inject(['remote.modelKeyPool'], child => {
-    const call: Call = async (method, payload) => {
+    const call = (async (method: 'read' | 'save' | 'restore' | 'diagnose', payload?: unknown) => {
       const result = await poolRemote.methods[`modelKeyPool/${method}`].invoke(child.remote, method === 'read' ? {} : { payload })
       if (!('ok' in result)) throw new Error('DSH 返回了意外的流式设置响应')
       if (!result.ok) throw new Error(result.error.message)
-      return result.value as View
-    }
+      return result.value
+    }) as Call
     const Page = () => <Card call={call} />
     child.effect(() => child.configForms.whileServed([NS], () => child.slots.inject(
       'settings.plugins.tab', () => child.slots.register({

@@ -18,6 +18,7 @@ export const poolRemote = createTypertRemoteInfo({
   methods: {
     'modelKeyPool/read': method('Read model key pool settings and redacted health.'),
     'modelKeyPool/save': method('Commit model key pool settings and new credentials.', 'payload'),
+    'modelKeyPool/diagnose': method('Test one Key or fetch its upstream model catalog.', 'payload'),
     'modelKeyPool/restore': method('Restore the selected Key after verifying its configuration.', 'payload'),
   },
 }, z)

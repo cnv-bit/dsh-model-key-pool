@@ -11,7 +11,8 @@ import { z } from 'zod'
 import { PoolAdapter } from './adapter.ts'
 import { createBridge } from './bridge.ts'
 import { Checkpoints, claimProfile } from './checkpoints.ts'
-import { Config, credentialId, namespace, routeFor, validateConfig, type Channel, type PoolConfig } from './config.ts'
+import { Config, credentialId, namespace, normalizeEndpoint, routeFor, validUpstream, validateConfig, type Channel, type PoolConfig } from './config.ts'
+import { KeyDiagnostics } from './diagnostics.ts'
 import { policy } from './policy.ts'
 import { Scheduler } from './scheduler.ts'
 
@@ -20,21 +21,29 @@ export const name = namespace
 export const inject = ['llm', 'settings', 'credentials']
 
 type LiveConfig = { crossChannel: Volatile<boolean>; channels: Volatile<Channel[]> }
+const secretSchema = z.string().min(1).max(4096).regex(/^[\x21-\x7e]+$/)
 const saveSchema = z.object({
   revision: z.number().int().nonnegative(),
   config: z.object({ crossChannel: z.boolean(), channels: z.array(z.unknown()).max(32) }).strict(),
   newKeys: z.array(z.object({
     channelId: z.string().max(80), keyId: z.string().max(80),
-    secret: z.string().min(1).max(4096).regex(/^[\x21-\x7e]+$/),
+    secret: secretSchema,
   }).strict()).max(128),
 }).strict()
 const restoreSchema = z.object({
   channelId: z.string().max(80), keyId: z.string().max(80), modelId: z.string().max(160),
 }).strict()
+const diagnosticSchema = z.object({
+  channelId: z.string().max(80), keyId: z.string().max(80),
+  kind: z.enum(['google', 'openai']), endpoint: z.string().max(2048),
+  model: z.string().min(1).max(160).optional(), secret: secretSchema.optional(),
+  revision: z.number().int().positive(),
+}).strict()
 const json = (entry: unknown): z.core.util.JSONType => JSON.parse(JSON.stringify(entry))
 
 class PoolService extends TypertRemoteService {
   private pendingWrite = Promise.resolve()
+  private readonly diagnostics = new KeyDiagnostics()
   private readonly host: Context
   private readonly scheduler: Scheduler
   private readonly checkpoints: Checkpoints
@@ -75,6 +84,28 @@ class PoolService extends TypertRemoteService {
     const work = this.pendingWrite.then(() => this.commit(payload))
     this.pendingWrite = work.then(() => {}, () => {})
     return work
+  }
+
+  @Remote
+  async diagnose(payload: unknown) {
+    const parsed = diagnosticSchema.safeParse(payload)
+    if (!parsed.success) throw new Error('请检查测试所用的 Key 或模型 ID')
+    const { channelId, keyId, kind, revision, model } = parsed.data
+    if (model && !validUpstream(kind, model)) throw new Error('上游模型 ID 无效')
+    const endpoint = normalizeEndpoint(kind, parsed.data.endpoint)
+    let secret = parsed.data.secret
+    if (!secret) {
+      const channel = this.scheduler.config.channels.find(entry => entry.id === channelId)
+      const key = channel?.keys.find(entry => entry.id === keyId)
+      if (!key) throw new Error('请先输入 API Key')
+      if (key.revision !== revision || channel?.kind !== kind || channel.endpoint !== endpoint) {
+        throw new Error('凭证版本或渠道地址已变更，请重新载入配置或输入新 Key')
+      }
+      const record = await this.host.credentials.readRecord(this.credential(channelId, keyId, revision))
+      secret = record?.kind === 'api-key' ? record.key : undefined
+      if (!secret || !secretSchema.safeParse(secret).success) throw new Error('已保存的凭证不可用，请重新输入')
+    }
+    return json(await this.diagnostics.run({ kind, endpoint, secret, model }))
   }
 
   private async commit(payload: unknown) {

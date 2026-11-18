@@ -25,8 +25,7 @@ function validRequest(req: IncomingMessage, destination: Destination): boolean {
   return path === `/v1beta/models/${destination.model}:streamGenerateContent`
 }
 
-async function readFailure(response: Response, secret: string): Promise<UpstreamFailure> {
-  const retryAfter = response.headers.get('retry-after') ?? undefined
+export async function readBoundedBody(response: Response, limit: number): Promise<string> {
   const reader = response.body?.getReader()
   const decoder = new TextDecoder()
   let body = ''
@@ -35,23 +34,27 @@ async function readFailure(response: Response, secret: string): Promise<Upstream
     while (reader) {
       const chunk = await reader.read()
       if (chunk.done) break
-      body += decoder.decode(chunk.value.subarray(0, policy.errorBytes - bytes), { stream: true })
+      body += decoder.decode(chunk.value.subarray(0, limit - bytes), { stream: true })
       bytes += chunk.value.length
-      if (bytes >= policy.errorBytes) break
+      if (bytes >= limit) break
     }
     body += decoder.decode()
   } finally {
     if (reader) void reader.cancel().catch(() => {})
   }
-  let canonical = body
-  try { canonical = JSON.stringify(JSON.parse(body)) }
-  catch { /* Non-JSON gateway errors are retained as bounded text. */ }
-  const redacted = canonical.replaceAll(secret, '[REDACTED]')
+  return body
+}
+
+export async function readFailure(response: Response, secret: string): Promise<UpstreamFailure> {
+  const retryAfter = response.headers.get('retry-after') ?? undefined
+  const body = await readBoundedBody(response, policy.errorBytes)
+  const redact = (text: string) => text.replaceAll(secret, '[REDACTED]')
     .replace(/AIza[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{16,}|Bearer\s+[^\s"']+/g, '[REDACTED]')
   try {
-    return { status: response.status, retryAfter, body: JSON.parse(redacted) }
+    const decoded = JSON.parse(body, (_, value) => typeof value === 'string' ? redact(value) : value)
+    return { status: response.status, retryAfter, body: decoded }
   } catch {
-    return { status: response.status, retryAfter, body: redacted }
+    return { status: response.status, retryAfter, body: redact(body) }
   }
 }
 

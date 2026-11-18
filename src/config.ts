@@ -78,6 +78,22 @@ const plainConfig = validate.object({
 export const routeFor = (id: string) => `model-key-pool-${id}`
 export const credentialId = (channel: string, key: string, revision: number) => `${channel}.${key}.${revision}`
 
+export function normalizeEndpoint(kind: Protocol, endpoint: string) {
+  if (kind === 'google') return googleEndpoint
+  let url: URL
+  try { url = new URL(endpoint) }
+  catch { throw new Error('请填写有效的兼容渠道地址') }
+  const localHttp = url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
+  if ((url.protocol !== 'https:' && !localHttp) || url.username || url.password || url.search || url.hash) {
+    throw new Error('兼容渠道使用 HTTPS 或本机 HTTP 地址，请去掉登录信息、查询参数和片段')
+  }
+  return url.href.replace(/\/+$/, '')
+}
+
+export function validUpstream(kind: Protocol, model: string) {
+  return (kind === 'google' ? modelPattern : upstreamPattern).test(model)
+}
+
 function validateIds(entries: { id: string }[]) {
   if (new Set(entries.map(entry => entry.id)).size !== entries.length) throw new Error('配置包含重复的 ID')
 }
@@ -90,20 +106,9 @@ export function validateConfig(input: unknown): PoolConfig {
   const requestedCandidates = config.channels.reduce((count, channel) => count + channel.keys.length * channel.models.length, 0)
   if (requestedCandidates > policy.candidateCapacity) throw new Error('渠道、模型和 Key 组合超过密钥池容量')
   for (const channel of config.channels) {
-    if (channel.kind === 'google') {
-      channel.endpoint = googleEndpoint
-      if (channel.models.some(model => !modelPattern.test(model.upstream))) {
-        throw new Error('Google 上游模型填模型 ID，不含 models/ 前缀')
-      }
-    } else {
-      let url: URL
-      try { url = new URL(channel.endpoint) }
-      catch { throw new Error('请填写有效的兼容渠道地址') }
-      const localHttp = url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
-      if ((url.protocol !== 'https:' && !localHttp) || url.username || url.password || url.search || url.hash) {
-        throw new Error('兼容渠道使用 HTTPS 或本机 HTTP 地址，请去掉登录信息、查询参数和片段')
-      }
-      channel.endpoint = url.href.replace(/\/+$/, '')
+    channel.endpoint = normalizeEndpoint(channel.kind, channel.endpoint)
+    if (channel.models.some(model => !validUpstream(channel.kind, model.upstream))) {
+      throw new Error('Google 上游模型填模型 ID，不含 models/ 前缀')
     }
     validateIds(channel.models)
     validateIds(channel.keys)

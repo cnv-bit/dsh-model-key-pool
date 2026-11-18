@@ -25,5 +25,9 @@ export const policy = Object.freeze({
   backoffJitter: 0.1,
   errorBytes: 16_384,
   errorSummaryChars: 800,
+  diagnosticTimeoutMs: 15_000,
+  diagnosticIntervalMs: 500,
+  catalogBytes: 1_000_000,
+  catalogPages: 5,
   checkpointBytes: 1_000_000,
 })
