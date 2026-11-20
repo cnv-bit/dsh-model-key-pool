@@ -25,12 +25,15 @@ function validRequest(req: IncomingMessage, destination: Destination): boolean {
   return path === `/v1beta/models/${destination.model}:streamGenerateContent`
 }
 
-export async function readBoundedBody(response: Response, limit: number): Promise<string> {
+export async function readBoundedBody(response: Response, limit: number, signal?: AbortSignal): Promise<string> {
   const reader = response.body?.getReader()
   const decoder = new TextDecoder()
+  const cancel = () => { if (reader) void reader.cancel().catch(() => {}) }
+  signal?.addEventListener('abort', cancel, { once: true })
   let body = ''
   let bytes = 0
   try {
+    signal?.throwIfAborted()
     while (reader) {
       const chunk = await reader.read()
       if (chunk.done) break
@@ -39,8 +42,10 @@ export async function readBoundedBody(response: Response, limit: number): Promis
       if (bytes >= limit) break
     }
     body += decoder.decode()
+    signal?.throwIfAborted()
   } finally {
-    if (reader) void reader.cancel().catch(() => {})
+    signal?.removeEventListener('abort', cancel)
+    cancel()
   }
   return body
 }

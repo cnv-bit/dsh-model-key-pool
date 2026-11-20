@@ -13,6 +13,7 @@ import { createBridge, type UpstreamFailure } from './bridge.ts'
 import { Checkpoints, claimProfile } from './checkpoints.ts'
 import { Config, credentialId, namespace, normalizeEndpoint, routeFor, validUpstream, validateConfig, type Channel, type PoolConfig } from './config.ts'
 import { KeyDiagnostics, type ModelCheck } from './diagnostics.ts'
+import { installGoogleErrorLog } from './google-error-log.ts'
 import { policy } from './policy.ts'
 import { Scheduler } from './scheduler.ts'
 
@@ -274,12 +275,16 @@ export async function apply(ctx: Context, live: LiveConfig) {
   const checkpoints = new Checkpoints(join(profileDir, namespace, 'runtime-checkpoints.json'), scheduler)
   await checkpoints.load()
   const bridge = await createBridge()
+  const stopGoogleErrorLog = installGoogleErrorLog(join(profileDir, namespace, 'google-errors.jsonl'), () => {
+    ctx.logger(namespace).warn('无法写入 Google 错误日志，请检查 profile 目录权限和磁盘空间。')
+  })
   let registration: AdapterRegistrationHandle | undefined
   ctx.effect(() => async () => {
     lifecycle.abort()
     scheduler.close()
     registration?.()
     bridge.close()
+    await stopGoogleErrorLog()
     await checkpoints.close()
   })
   ctx.effect(() => ctx.settings.configure({ auto: false }, ctx.fiber))
